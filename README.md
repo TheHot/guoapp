@@ -35,7 +35,7 @@ Flutter 多端独立短剧 / 影视应用，原名「短剧库 APP」。站源�
 | 画质增强 | 仅 Windows 桌面端显示并运行增强链路（关闭 / 自动 / 省电增强 / 清晰优先）；移动端与电视端隐藏 |
 | 弹幕 | 红果在线播放默认开启；播放器侧边圆形「弹」字按钮可关闭、查看状态及失败重试。本地播放不加载弹幕 |
 | 下载 | 播放页「下载」Tab 和详情页下载入口均可选择分集与画质；支持批量暂停、继续、重试、删除及清理任务但保留视频。「更新本剧」补新增或缺失分集 |
-| 更多 | 站源管理、用户管理、设置与备份、界面模式、关于 |
+| 更多 | 站源管理、用户管理、下载、界面模式、关于。底栏最右侧为「设置」（与原「下载」位置互换，点按直接打开设置页） |
 
 | 站源 | 浏览与播放 | 搜索 |
 | --- | --- | --- |
@@ -62,6 +62,68 @@ Flutter 多端独立短剧 / 影视应用，原名「短剧库 APP」。站源�
 两台设备在同一局域网直连，自动同步追剧记录或接续播放，不依赖账号服务器。服务类型 `_zgj-link._tcp`（DNS-SD / mDNS），按设备 ID 合并多网卡地址，首次配对记录证书指纹，后续连接固定校验。
 
 入口：「追剧 → 标题栏同步」或「设置与备份 → 设备互联」。手动同步默认「双向合并」，可选覆盖对方 / 覆盖本机，先「查看预览」再执行；自动同步仅发送改动条目与删除标记，播放期间约每 10 秒发送进度。冲突记录保留候选，用户从同步页逐项处理。
+
+### WebDAV 备份：配置与追剧云端同步（已接入，待设备验证）
+
+入口：「设置与备份 → WebDAV 备份」。填写地址、账号、密码与目录（留空使用默认目录 duanju），「保存并测试连接」通过后即可「备份到 WebDAV」或「从 WebDAV 恢复」。
+
+备份内容与「导出配置备份」一致：各用户配置、观看记录、追剧状态、收藏与播放进度，不含视频文件；恢复沿用既有备份格式与确认流程。账号密码只保存在本机，不进入备份内容，也不参与局域网互联同步。备份文件名按平台区分（如 zhenguojian-backup-android.json），多设备各存一份，互不覆盖。
+
+### 播放器手势修复：倍速锁定 / 音量 / 亮度（0.2.66+73）
+
+- **倍速上滑锁定**：修复长按倍速中手指刚移动就恢复原速并弹出「恢复 1 倍速」的问题——倍速保持期间的指针移动现在只服务于锁定/解锁手势，不再触发音量、亮度与进度滑动；锁定态再次长按不会重新调速，仅提示「下滑解锁」，松手未滑过阈值则保持锁定。
+- **音量手势**：改为以手势起点音量快照本地推算，消除异步音量流滞后导致的显示与实际漂移；移除「超过 100%」音量增强（对 libmpv 无效，实际音量不会变化），音量上限即 100%，设置项中相应开关已移除。
+- **亮度手势**：手势起点改为同步读取缓存亮度作为基准，不再被异步平台读取覆盖，显示数字与实际亮度一致；手势结束后回读平台实际值刷新缓存。
+
+### 播放体验优化：倍速隐藏控件 / 播放常亮（0.2.67+74）
+
+- **长按倍速时控件全隐藏**：倍速起始瞬间自动隐藏全部播放器控件（顶栏、播放/暂停、进度条、底栏等），只保留倍速 HUD pill 与锁定提示；倍速结束后恢复进入倍速前的显隐状态——此前控件已隐藏则保持隐藏，倍速中的「恢复 1 倍速」提示也不会把控件弹回。倍速期间 4 秒自动隐藏计时暂停，控件不会中途闪回。
+- **播放时屏幕常亮**：播放中通过 `FLAG_KEEP_SCREEN_ON` 保持屏幕常亮，不受系统省电策略的自动息屏与降亮度影响；暂停、退出播放或切换页面即解除，恢复系统默认行为。
+
+### 红果源修复与液态玻璃界面（0.2.68+75）
+
+合入上游 PR #12（红果源失效修复 + 液态玻璃 UI），要点：
+
+- **红果源签名与解析修复**：请求签名改用 nonce 随机数体系（X-Argus / X-Ladon / X-Gorgon），`video_model` 解析兼容对象、base64 JSON 与明文 JSON 三种下发结构，媒体地址提取覆盖 `main_url` / `backup_url` / `backup_urls` / `url_list` 并跳过 bytevc2 等不兼容编码。
+- **Android 播放器切换为 libmpv + MediaCodec 硬解**：Android 端不再走 ExoPlayer（`video_player` 依赖已移除），统一使用 media_kit 的 libmpv，硬解方案改为 `mediacodec-copy`（解码后拷贝回 GPU，兼顾兼容与亮度/色彩增强）；新增硬解自愈——播放 8 秒仍无视频尺寸时自动回退软件解码并seek 回原位。
+- **HLS 识别改为内容嗅探优先**：以 `#EXTM3U` 文件头嗅探结果覆盖 Content-Type，避免 CDN 把 MP4 误标为 mpegurl；HEAD 请求对无 Content-Type / octet-stream / text-plain 的场景补一次 512 字节 Range 探测。
+- **液态玻璃界面**：新增主题设置页（液态玻璃模糊、悬浮底栏、深浅色、界面缩放），设置页加入后台缓存优化，底栏与首页改为玻璃质感导航。
+- **剔除**：上游分支中误提交的工作产物（记忆文件、验证截图、中文说明文档）未纳入本仓库。
+
+### 设置页 Material 化、液态玻璃移植与红果取流修复（0.2.69+76）
+
+- **设置页 UI 统一为 Flutter Material 风格**：主题设置页不再依赖 `flutter_miuix`（该依赖已从工程移除），改用标准 Material 组件——`Scaffold` / `AppBar` / `ChoiceChip`（主题三选）/ `SwitchListTile.adaptive` / `Slider.adaptive` / `ScaffoldMessenger`，排布与「播放器与手势」等设置页保持一致；模糊、悬浮底栏、液态玻璃、返回手势、界面缩放四组功能与联动规则不变。
+- **液态玻璃效果改用 SukiSU-Ultra 实现**：视觉算法移植自 [SukiSU-Ultra](https://github.com/ShirkNeko/SukiSU-Ultra)（`ui/component/liquid` 与 `FloatingBottomBar.kt`，上游 [AndroidLiquidGlass](https://github.com/Kyant0/AndroidLiquidGlass)，Apache-2.0）：
+  - 新增透镜折射着色器 `shaders/liquid_glass.frag`，经 `BackdropFilter` + `ImageFilter.shader` 对底栏背后内容做**圆角矩形边缘透镜折射**（圆角 SDF + circleMap 位移），选中项 pill 额外带**深度折射与色散**；
+  - 玻璃面叠加饱和度提升（vibrancy 1.5×）与轻度模糊，容器色 `surfaceContainer @ 0.4`，轮廓为方向光高光描边（BloomStroke 简化移植），选中 pill 带内阴影，整体投影 10dp；
+  - 玻璃渲染区相对胶囊形外扩 40dp 为折射提供真实背景采样，形状之外由着色器裁掉；
+  - 运行环境不支持 `ImageFilter.shader`（非 Impeller 后端）或着色器加载失败时，自动回退到纯 Flutter 毛玻璃外观，功能不受影响。
+- **红果取流修复（服务端风控旧链路）**：旧 `video_model` 接口与五签名头已被风控（任何请求均返回空 body），改为移植 [hongguo-web](https://github.com/sunnysky123/hongguo-web) 的新链路：
+  - `POST /novel/player/multi_video_model/v1/`，完整合成真机设备参数（28 字段保序）与 python 风格 URL 编码；
+  - 六签名头（X-Gorgon / X-Khronos / X-Ladon / X-Argus / X-Helios / X-Medusa）以纯 Go 重写（`native/core/provider_hongguo_pure_sign.go`），含 RC4 变体、位旋转、md5 V3、hashF13、Feistel 与 AesV3，与 Node 参考实现逐项对拍一致；
+  - 响应经 `fallback_api` 二次裸请求取媒体列表，`key_seed` 经双 SHA-512 派生 AES-128-CBC 密钥解密媒体地址；选流优先 H.264/HEVC 并校验 VOD 域名白名单。
+
+### 液态玻璃定位修复与底栏导航互换（0.2.70+77）
+
+- **液态玻璃定位修复**：修复玻璃效果渲染到屏幕正中、顶/底栏无变化的问题。根因是 `ImageFilter.shader` 的滤镜输入纹理恒为整屏快照（`Canvas::SaveLayer` 对 backdrop filter 的 `flood_input_coverage` 语义），旧着色器用 `u_size * 0.5` 反推形状位置必然落在屏幕中心；现新增 `u_shape_center` uniform 显式传入形状的屏幕坐标（`LiquidGlassSurface` 以后置帧回调 `localToGlobal` 动态跟踪位置，缓存键含中心点），并移除 GLES 端错误的 y 翻转（经引擎源码与实验双重确认 Impeller-GLES / Vulkan 均无需翻转）。
+- **顶栏液态玻璃**：新增 `LiquidGlassPanel` 通栏玻璃面板与 `LiquidGlassStyle.top`（直角通栏），首页顶栏在液态玻璃开启时获得与底栏一致的透镜折射质感（tint 0.45，可透视列表内容）；着色器不可用时退化为纯模糊。
+- **底栏与三点菜单互换**：底栏最右侧由「下载」改为「设置」（点按直接推设置页，不抢当前 tab 选中态），「下载」移入右上角三点菜单（仅在有下载权限时显示），TV 侧栏与桌面 Rail 同步互换。
+
+### 液态玻璃效果链对齐 Kyant0/AndroidLiquidGlass（0.2.71+78）
+
+- **模糊改为真实高斯**：原着色器内十字 5 抽头等效 sigma 仅 ~1.4px，远弱于 SukiSU `blur(4dp)`（按 AOSP 换算 sigma = 0.57735·radius + 0.5）。现移除 `u_blur_radius` 与抽头模糊，改由 `ImageFilter.compose(outer: shader, inner: blur)` 在上游做真实高斯，sigma 按同一公式换算；着色器只负责透镜折射与色散。
+- **色散强度对齐**：Kyant0 `Lens.kt` 将 chromaticAberration 作布尔量传入（uniform 恒 1f），原实现传 0.5 只有一半强度，现改为 1（`u_chromatic_aberration` 按 >0 量化）。
+- **逐行核对确认无偏差项**：负折射符号（`refractionAmount` 取负）与我方一致；vibrancy（`saturation 1.5×`）等价；辉光层级（bar 高光 0.75 → InteractiveHighlight → 隐形行捕获 → pill 最上层）与 SukiSU `FloatingBottomBar.kt` 的 `combinedBackdrop` 语义一致。
+- **动效核对**：指针 / 六弹簧（press、value、scaleX/Y、velocity）与 `DampedDragAnimation.kt` 逐条一致（velocity = 速度 / span 且每帧 snap、release 待 |value-target| < span·0.025 才归零按压与缩放）；色散 A/B 与透镜位移经截图量化验证（色散仅激活于透镜带、右缘位移 ~7-8px）。
+
+### 页面切换滑动化与桌面鼠标拖拽支持（0.2.72+79）
+
+- **底栏 tab 点按平滑滑动**：移动端内容区由直接切换改为 `PageView`，点按底栏 tab 时内容区以 320ms `easeOutCubic` 平滑滑到目标页（类左右刷浏览图片体验），底栏高亮即时同步。
+- **内容区左右划切换**：`PageView.onPageChanged` 驱动底栏高亮，内容区支持左右划跟手切换，与底栏双向同步；小距离拖动（不足半页）弹回原页。
+- **桌面鼠标拖拽支持**：Flutter 默认 `ScrollBehavior.dragDevices` 不含 `PointerDeviceKind.mouse`（拖拽手势预留给文本选择），导致 Windows / Linux 桌面版鼠标无法滑动切换页面；新增 `_PageSwipeBehavior` 显式纳入鼠标，使桌面端与触屏、触控板行为一致。
+- **发现页去滑动冲突**：移除发现页左右划切换剧集类目的手势，避免与页面滑动手势冲突。
+- **设置一级化**：设置与其他 tab 同为一级页面（有底栏、无左上返回按钮），非 push 二级界面。
+- **药丸通透修复**：液态玻璃选中 pill 移除 `vibrancy` 与 `blurRadius`（仅透镜折射），达到「透明且边缘光线扭曲」的通透效果。
 
 ## 安装包与平台状态
 

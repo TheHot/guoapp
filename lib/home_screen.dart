@@ -1,11 +1,12 @@
 import 'dart:async';
+import 'dart:ui' show ImageFilter, PointerDeviceKind;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app_layout.dart';
 import 'app_bottom_navigation.dart';
-import 'app_build.dart';
+import 'app_glass.dart';
 import 'core_bridge.dart';
 import 'catalog_filters.dart';
 import 'catalog_browser.dart';
@@ -25,14 +26,31 @@ import 'vip_icon.dart';
 import 'settings_screen.dart';
 import 'profiles_screen.dart';
 import 'search_input.dart';
-import 'source_gate_dialog.dart';
-import 'source_gate_taps.dart';
 import 'sources_screen.dart';
 import 'batch_download_screen.dart';
 import 'batch_downloads.dart';
 import 'drama_actions.dart';
 import 'library_updater.dart';
 import 'saved_library.dart';
+
+/// 桌面端（鼠标）也允许拖拽切换页面。
+///
+/// Flutter 默认 [ScrollBehavior.dragDevices] 不含 [PointerDeviceKind.mouse]
+/// （拖拽手势预留给文本选择），触屏 / 触控板不受影响；这里显式加入鼠标，
+/// 使 Windows / Linux 桌面版的左右划切换与移动端一致。
+class _PageSwipeBehavior extends ScrollBehavior {
+  const _PageSwipeBehavior();
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => const {
+    PointerDeviceKind.touch,
+    PointerDeviceKind.stylus,
+    PointerDeviceKind.invertedStylus,
+    PointerDeviceKind.trackpad,
+    PointerDeviceKind.mouse,
+    PointerDeviceKind.unknown,
+  };
+}
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.repository, required this.store});
@@ -44,6 +62,13 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   static const _recommendationCategory = 'app:recommendations';
+  /// 内容区 PageView 的稳定标识：确保导航切换 / 状态重建时复用同一
+  /// [_PageViewState]，避免每次 rebuild 重建滚动位置（会导致滑动中点页面
+  /// 跳回首屏）。
+  final GlobalKey _pageViewKey = GlobalKey(debugLabel: 'home-content-pages');
+  /// 页面被其他路由覆盖（如播放页压栈）时缓存的子树：
+  /// 后台期间 store 的通知直接复用它，跳过整页网格重建。
+  Widget? _backgroundCache;
   final _search = TextEditingController();
   final _scroll = ScrollController();
   Timer? _debounce;
@@ -56,6 +81,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _error;
   int _generation = 0;
   int _tab = 0;
+  /// 底栏 / 侧栏 / Rail 中「设置」项的固定索引（与三点菜单的「下载」互换后，
+  /// 原「下载」tab 槽位改为「设置」，与其他一级 tab 平级）。
+  static const _settingsNavIndex = 3;
+  /// 内容区 PageView 控制器（移动端）：点按底栏 tab 平滑滑动切换，左右划
+  /// 内容区亦可切换（onPageChanged 同步底栏高亮）。
+  late final PageController _pageController;
   String _submittedQuery = '';
   final _categorySelections = <String, String>{};
   late final CatalogBrowser _browser;
@@ -70,7 +101,6 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _refreshingUpdatedCache = false;
   bool _selectionMode = false;
   bool _showRecommendations = false;
-  final _recentTaps = RepeatTapGate();
   String _sourceSignature = '';
   bool _catalogLoadScheduled = false;
 
@@ -293,19 +323,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _load(useCache: true);
   }
 
-  void _swipeCategory(DragEndDetails details) {
-    final velocity = details.primaryVelocity ?? 0;
-    if (velocity.abs() < 240) return;
-    final categories = _displayCategories;
-    final index = categories.indexWhere(
-      (entry) => entry.id == _displayCategory,
-    );
-    final next = index + (velocity < 0 ? 1 : -1);
-    if (next >= 0 && next < categories.length) {
-      _changeCategory(categories[next].id);
-    }
-  }
-
   void _toggleSearch() {
     if (AppLayout.isTelevision(context)) {
       _televisionSearch();
@@ -413,7 +430,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_selectionMode) {
       _cancelSelection();
     } else if (_tab != 0) {
-      setState(() => _tab = 0);
+      _changeTab(0);
+      _animateToTab(0);
     } else if (_search.text.isNotEmpty) {
       _search.clear();
       _searchChanged('');
@@ -423,6 +441,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _pageController = PageController(initialPage: _tab);
     _scroll.addListener(_onCatalogScroll);
     _source = SourceSite.byId(widget.store.source);
     _allSources = widget.store.catalogView.allSources;
@@ -459,6 +478,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _search.dispose();
     _scroll.removeListener(_onCatalogScroll);
     _scroll.dispose();
+    _pageController.dispose();
     super.dispose();
   }
 
@@ -676,21 +696,68 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// 连点「最近观看」6 次弹出站源密码锁（用于启用 / 关闭密码功能）。
   /// 仅多源包（真果鉴）生效；红果鉴单源包无密码功能。
+  ///
+  /// 「设置」与其他一级 tab 平级：点按直接切入设置 tab 内容区（有底栏、
+  /// 无返回按钮）。移动端内容区为 PageView，点按 tab 时平滑滑动过去；
+  /// 桌面 / 电视端为侧栏 / Rail 直接切换，无滑动。
   void _onNavSelected(int tab) {
-    if (allSourcesEnabled && tab == 2) {
-      if (_recentTaps.register(tab)) {
-        _openSourceGate();
-        return;
-      }
-    } else {
-      _recentTaps.reset();
-    }
     _changeTab(tab);
+    _animateToTab(tab);
   }
 
-  void _openSourceGate() {
-    _pauseCatalog();
-    unawaited(showSourceGateDialog(context, widget.store));
+  /// 移动端把内容区 PageView 平滑滑动到 [tab]（类浏览图片的左右滑动体验，
+  /// 与底栏高亮同步）；桌面 / 电视端无操作。
+  void _animateToTab(int tab) {
+    final mobile =
+        !AppLayout.isTelevision(context) &&
+        MediaQuery.sizeOf(context).width < 840;
+    if (!mobile || !_pageController.hasClients) return;
+    if (_pageController.page?.round() == tab) return;
+    _pageController.animateToPage(
+      tab,
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  /// 内容区左右划切换（PageView.onPageChanged）：底栏高亮跟随滑动。
+  void _onPageChanged(int page) {
+    if (page == _tab) return;
+    _changeTab(page);
+  }
+
+  /// 按 tab 索引构建内容页（PageView 每页固定 key，滑出后状态自然释放，
+  /// 相邻页保持；_tab 变化不重建页面，避免滑动中途内容跳变）。
+  Widget _tabPage(int tab, {required bool selectionInBody}) {
+    switch (tab) {
+      case 0:
+        return widget.store.sources.isEmpty
+            ? const StatusPanel(
+                title: '暂无可用站源',
+                message: '请联系管理员为当前用户开放站源。',
+              )
+            : _catalog(selectionInBody: selectionInBody);
+      case _settingsNavIndex:
+        return SettingsScreen(
+          key: const ValueKey('settings-tab'),
+          repository: widget.repository,
+          store: widget.store,
+          embedded: true,
+        );
+      default:
+        return SavedLibrary(
+          key: ValueKey('saved-tab-$tab'),
+          repository: widget.repository,
+          store: widget.store,
+          history: tab == 2,
+          onOpen: _openDrama,
+          onContinue: (drama) => _openDrama(drama, resume: true),
+          onDownload:
+              widget.repository.supportsDownloads && widget.store.canDownload
+              ? (drama) => _openDrama(drama, download: true)
+              : null,
+        );
+    }
   }
 
   void _cancelSelection() => setState(() {
@@ -790,6 +857,40 @@ class _HomeScreenState extends State<HomeScreen> {
       _group.sources.any((source) => source.id == 'huangdou');
   bool get _hideVip => _supportsVipFilter && widget.store.hideVip;
 
+  /// 顶栏玻璃层：液态玻璃（透镜折射）优先，否则纯模糊，再否则不绘制。
+  Widget _buildTopBarGlass(
+    BuildContext context, {
+    required bool liquidGlass,
+    required bool blurred,
+  }) {
+    final colors = Theme.of(context).colorScheme;
+    if (liquidGlass) {
+      if (LiquidGlassShaders.available) {
+        return LiquidGlassPanel(
+          style: LiquidGlassStyle.top,
+          tint: colors.surface.withValues(alpha: 0.45),
+          bottomBorderColor: colors.outlineVariant.withValues(alpha: 0.4),
+        );
+      }
+      // 着色器不可用：退化为纯模糊外观（与液态玻璃关闭时一致）。
+      return ClipRect(
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+          child: ColoredBox(
+            color: colors.surface.withValues(alpha: 0.72),
+          ),
+        ),
+      );
+    }
+    if (!blurred) return const SizedBox.shrink();
+    return ClipRect(
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+        child: ColoredBox(color: colors.surface.withValues(alpha: 0.72)),
+      ),
+    );
+  }
+
   List<Drama> get _visible {
     final query = _search.text.trim().toLowerCase();
     return sortCatalog(
@@ -813,12 +914,40 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: widget.store,
-    builder: (context, _) => LayoutBuilder(
+    builder: (context, _) {
+      final route = ModalRoute.of(context);
+      if (route != null && !route.isCurrent && _backgroundCache != null) {
+        return _backgroundCache!;
+      }
+      final child = LayoutBuilder(
       builder: (context, constraints) {
         final television = AppLayout.isTelevision(context);
         final desktop = constraints.maxWidth >= 840;
+        final appearance = widget.store.themeAppearance;
+        final platformBars = !desktop && !television;
+        final blurredBars = appearance.blurBars && platformBars;
+        final floatingBar = appearance.floatingBar && platformBars;
+        // 液态玻璃顶栏：透镜折射替代纯模糊（需要内容延伸到顶栏之下）。
+        final topLiquidGlass = appearance.liquidGlass && platformBars;
         final scaffold = Scaffold(
+          extendBodyBehindAppBar: blurredBars || topLiquidGlass,
+          extendBody: floatingBar || blurredBars,
           appBar: AppBar(
+            backgroundColor:
+                blurredBars || topLiquidGlass ? Colors.transparent : null,
+            elevation: blurredBars || topLiquidGlass ? 0 : null,
+            scrolledUnderElevation: blurredBars || topLiquidGlass ? 0 : null,
+            flexibleSpace: blurredBars || topLiquidGlass
+                ? ValueListenableBuilder<int>(
+                    // 着色器异步就绪后重建，从纯模糊切换到液态玻璃。
+                    valueListenable: LiquidGlassShaders.ready,
+                    builder: (context, _, _) => _buildTopBarGlass(
+                      context,
+                      liquidGlass: topLiquidGlass,
+                      blurred: blurredBars,
+                    ),
+                  )
+                : null,
             toolbarHeight: television ? 64 : null,
             titleSpacing: 12,
             title: _selectionMode
@@ -866,6 +995,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ),
                   )
+                : _tab == _settingsNavIndex
+                ? const Text('设置')
                 : const Text(appName),
             actions: [
               if (_selectionMode) ...[
@@ -953,11 +1084,11 @@ class _HomeScreenState extends State<HomeScreen> {
                       _refreshCatalog();
                     } else if (value == 'sources') {
                       _manageSources();
-                    } else if (value == 'settings') {
+                    } else if (value == 'downloads') {
                       Navigator.push(
                         context,
                         MaterialPageRoute<void>(
-                          builder: (_) => SettingsScreen(
+                          builder: (_) => DownloadsScreen(
                             repository: widget.repository,
                             store: widget.store,
                           ),
@@ -1007,10 +1138,11 @@ class _HomeScreenState extends State<HomeScreen> {
                         child: Text('站源管理'),
                       ),
                     const PopupMenuItem(value: 'users', child: Text('用户管理')),
-                    const PopupMenuItem(
-                      value: 'settings',
-                      child: Text('设置与备份'),
-                    ),
+                    if (widget.store.canDownload)
+                      const PopupMenuItem(
+                        value: 'downloads',
+                        child: Text('下载'),
+                      ),
                     const PopupMenuItem(value: 'display', child: Text('界面模式')),
                     const PopupMenuItem(
                       value: 'about',
@@ -1022,9 +1154,19 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(width: 8),
             ],
           ),
-          body: SafeArea(
-            top: false,
-            child: Row(
+          body: Padding(
+            padding: EdgeInsets.only(
+              top: blurredBars
+                  ? MediaQuery.paddingOf(context).top +
+                        (television ? 64 : kToolbarHeight)
+                  : 0,
+            ),
+            // 底部不裁切：让列表内容从悬浮底栏下方穿过，模糊/液态玻璃才有内容可糊；
+            // 列表尾部通过 MediaQuery.padding.bottom（extendBody 时 = 底栏高度）补偿。
+            child: SafeArea(
+              top: !blurredBars,
+              bottom: false,
+              child: Row(
               children: [
                 if (television) ...[
                   SizedBox(
@@ -1038,8 +1180,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             (Icons.explore_rounded, '发现'),
                             (Icons.bookmark_rounded, '追剧'),
                             (Icons.history_rounded, '最近观看'),
-                            if (widget.store.canDownload)
-                              (Icons.download_rounded, '下载'),
+                            (Icons.settings_rounded, '设置'),
                           ].indexed)
                             Padding(
                               padding: const EdgeInsets.only(bottom: 14),
@@ -1078,47 +1219,33 @@ class _HomeScreenState extends State<HomeScreen> {
                         icon: Icon(Icons.history_rounded),
                         label: Text('最近观看'),
                       ),
-                      if (widget.store.canDownload)
-                        NavigationRailDestination(
-                          icon: Icon(Icons.download_outlined),
-                          selectedIcon: Icon(Icons.download_rounded),
-                          label: Text('下载'),
-                        ),
+                      NavigationRailDestination(
+                        icon: Icon(Icons.settings_outlined),
+                        selectedIcon: Icon(Icons.settings_rounded),
+                        label: Text('设置'),
+                      ),
                     ],
                   ),
                   const VerticalDivider(width: 1, thickness: 1),
                 ],
-                Expanded(
-                  child: _tab == 0
-                      ? widget.store.sources.isEmpty
-                            ? const StatusPanel(
-                                title: '暂无可用站源',
-                                message: '请联系管理员为当前用户开放站源。',
-                              )
-                            : _catalog(selectionInBody: desktop || television)
-                      : _tab == 3
-                      ? DownloadsScreen(
-                          repository: widget.repository,
-                          store: widget.store,
-                          embedded: true,
-                        )
-                      : SavedLibrary(
-                          key: ValueKey('saved-tab-$_tab'),
-                          repository: widget.repository,
-                          store: widget.store,
-                          history: _tab == 2,
-                          onOpen: _openDrama,
-                          onContinue: (drama) =>
-                              _openDrama(drama, resume: true),
-                          onDownload:
-                              widget.repository.supportsDownloads &&
-                                  widget.store.canDownload
-                              ? (drama) => _openDrama(drama, download: true)
-                              : null,
+                        Expanded(
+                          child: desktop || television
+                              ? _tabPage(_tab, selectionInBody: true)
+                              : ScrollConfiguration(
+                                  behavior: const _PageSwipeBehavior(),
+                                  child: PageView.builder(
+                                    key: _pageViewKey,
+                                    controller: _pageController,
+                                    onPageChanged: _onPageChanged,
+                                    itemCount: 4,
+                                    itemBuilder: (context, index) =>
+                                        _tabPage(index, selectionInBody: false),
+                                  ),
+                                ),
                         ),
-                ),
               ],
             ),
+          ),
           ),
           bottomNavigationBar: desktop || television
               ? null
@@ -1127,6 +1254,9 @@ class _HomeScreenState extends State<HomeScreen> {
               : AppBottomNavigation(
                   selectedIndex: _tab,
                   onDestinationSelected: _onNavSelected,
+                  floating: floatingBar,
+                  blurred: blurredBars,
+                  liquidGlass: floatingBar && appearance.liquidGlass,
                   destinations: [
                     NavigationDestination(
                       icon: Icon(Icons.explore_outlined),
@@ -1142,20 +1272,22 @@ class _HomeScreenState extends State<HomeScreen> {
                       icon: Icon(Icons.history_rounded),
                       label: '最近观看',
                     ),
-                    if (widget.store.canDownload)
-                      NavigationDestination(
-                        icon: Icon(Icons.download_outlined),
-                        selectedIcon: Icon(Icons.download_rounded),
-                        label: '下载',
-                      ),
+                    NavigationDestination(
+                      icon: Icon(Icons.settings_outlined),
+                      selectedIcon: Icon(Icons.settings_rounded),
+                      label: '设置',
+                    ),
                   ],
                 ),
         );
-        if (!television && !_selectionMode) return scaffold;
+        if (!television && !_selectionMode && _tab == 0) return scaffold;
         return PopScope(
+          // 「设置」等非首 tab 为一级页面：系统返回先平滑滑回首个 tab，而不是
+          // 直接退出应用；首 tab 的返回保持原有退出行为。
           canPop:
+              _tab == 0 &&
               !_selectionMode &&
-              (!television || _tab == 0 && _search.text.isEmpty),
+              (!television || _search.text.isEmpty),
           onPopInvokedWithResult: (didPop, result) {
             if (!didPop) _televisionBack();
           },
@@ -1170,7 +1302,10 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       },
-    ),
+      );
+      _backgroundCache = child;
+      return child;
+    },
   );
 
   Widget _catalog({required bool selectionInBody}) {
@@ -1255,22 +1390,17 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         if (_showRecommendations)
           Expanded(
-            child: GestureDetector(
-              onHorizontalDragEnd: television ? null : _swipeCategory,
-              child: RecommendationsScreen(
-                repository: widget.repository,
-                store: widget.store,
-                embedded: true,
-              ),
+            child: RecommendationsScreen(
+              repository: widget.repository,
+              store: widget.store,
+              embedded: true,
             ),
           )
         else ...[
           if (_loading && _items.isNotEmpty)
             const LinearProgressIndicator(minHeight: 2),
           Expanded(
-            child: GestureDetector(
-              onHorizontalDragEnd: television ? null : _swipeCategory,
-              child: _loading && _items.isEmpty
+            child: _loading && _items.isEmpty
                   ? const Center(
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
@@ -1354,7 +1484,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   padding,
                                   0,
                                   padding,
-                                  16,
+                                  16 + MediaQuery.paddingOf(context).bottom,
                                 ),
                                 sliver: SliverGrid(
                                   gridDelegate: dramaGridDelegate(
@@ -1369,7 +1499,11 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                               SliverToBoxAdapter(
                                 child: Padding(
-                                  padding: const EdgeInsets.only(bottom: 24),
+                                  padding: EdgeInsets.only(
+                                    bottom:
+                                        24 +
+                                        MediaQuery.paddingOf(context).bottom,
+                                  ),
                                   child: Center(
                                     child: _loadingMore
                                         ? const CircularProgressIndicator()
@@ -1398,7 +1532,6 @@ class _HomeScreenState extends State<HomeScreen> {
                         );
                       },
                     ),
-            ),
           ),
           if (_selectionMode && selectionInBody)
             _selectionBar(safeBottom: false),
